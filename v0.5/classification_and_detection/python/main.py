@@ -489,20 +489,23 @@ def main():
     if args.time:
         # override the time we want to run
         settings.min_duration_ms = args.time * MILLI_SEC
-        settings.max_duration_ms = args.time * MILLI_SEC
+        #settings.max_duration_ms = args.time * MILLI_SEC
 
     if args.qps:
         qps = float(args.qps)
         settings.server_target_qps = qps
         settings.offline_expected_qps = qps
+        settings.multi_stream_target_qps = qps
 
     if count_override:
         settings.min_query_count = count
-        settings.max_query_count = count
+#        settings.max_query_count = count
 
     if args.samples_per_query:
         settings.multi_stream_samples_per_query = args.samples_per_query
+
     if args.max_latency:
+        settings.single_stream_expected_latency_ns = int(args.max_latency * NANO_SEC)
         settings.server_target_latency_ns = int(args.max_latency * NANO_SEC)
         settings.multi_stream_target_latency_ns = int(args.max_latency * NANO_SEC)
 
@@ -512,6 +515,7 @@ def main():
     log.info("starting {}".format(scenario))
     result_dict = {"good": 0, "total": 0, "scenario": str(scenario)}
     runner.start_run(result_dict, args.accuracy)
+    print("max query count:", settings.max_query_count)
     lg.StartTest(sut, qsl, settings)
 
     if not last_timeing:
