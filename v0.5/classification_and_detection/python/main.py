@@ -191,6 +191,8 @@ def get_args():
     parser.add_argument("--cache", type=int, default=0, help="use cache")
     parser.add_argument("--accuracy", action="store_true", help="enable accuracy pass")
     parser.add_argument("--find-peak-performance", action="store_true", help="enable finding peak performance pass")
+    parser.add_argument("--auto_qps", action="store_true", help="auto qps test")
+    
 
     # file to use mlperf rules compliant parameters
     parser.add_argument("--config", default="../mlperf.conf", help="mlperf rules config")
@@ -198,6 +200,7 @@ def get_args():
     # below will override mlperf rules compliant settings - don't use for official submission
     parser.add_argument("--time", type=int, help="time to scan in seconds")
     parser.add_argument("--count", type=int, help="dataset items to use")
+    parser.add_argument("--min_query_count", type=int, help="min query count")
     parser.add_argument("--max-latency", type=float, help="mlperf max latency in pct tile")
     parser.add_argument("--samples-per-query", type=int, help="mlperf multi-stream sample per query")
     args = parser.parse_args()
@@ -477,6 +480,7 @@ def main():
         global last_timeing
         last_timeing = [t / NANO_SEC for t in latencies_ns]
 
+
     settings = lg.TestSettings()
     settings.FromConfig(config, args.model_name, args.scenario)
     settings.scenario = scenario
@@ -491,15 +495,14 @@ def main():
         settings.min_duration_ms = args.time * MILLI_SEC
         #settings.max_duration_ms = args.time * MILLI_SEC
 
-    if args.qps:
-        qps = float(args.qps)
-        settings.server_target_qps = qps
-        settings.offline_expected_qps = qps
-        settings.multi_stream_target_qps = qps
+
 
     if count_override:
         settings.min_query_count = count
 #        settings.max_query_count = count
+
+    if args.min_query_count:
+        settings.min_query_count = args.min_query_count
 
     if args.samples_per_query:
         settings.multi_stream_samples_per_query = args.samples_per_query
@@ -509,32 +512,99 @@ def main():
         settings.server_target_latency_ns = int(args.max_latency * NANO_SEC)
         settings.multi_stream_target_latency_ns = int(args.max_latency * NANO_SEC)
 
-    sut = lg.ConstructSUT(issue_queries, flush_queries, process_latencies)
-    qsl = lg.ConstructQSL(count, min(count, 500), ds.load_query_samples, ds.unload_query_samples)
 
-    log.info("starting {}".format(scenario))
-    result_dict = {"good": 0, "total": 0, "scenario": str(scenario)}
-    runner.start_run(result_dict, args.accuracy)
-    print("max query count:", settings.max_query_count)
-    lg.StartTest(sut, qsl, settings)
+    def set_qps(current_qps):
+        settings.server_target_qps = current_qps
+        settings.offline_expected_qps = current_qps
+        settings.multi_stream_target_qps = current_qps
+        return current_qps
 
-    if not last_timeing:
-        last_timeing = runner.result_timing
-    if args.accuracy:
-        post_proc.finalize(result_dict, ds, output_dir=args.output)
-    add_results(final_results, "{}".format(scenario),
-                result_dict, last_timeing, time.time() - ds.last_loaded, args.accuracy)
+    if args.qps:
+        qps = set_qps(args.qps)
 
-    runner.finish()
-    lg.DestroyQSL(qsl)
-    lg.DestroySUT(sut)
 
-    #
-    # write final results
-    #
-    if args.output:
-        with open("results.json", "w") as f:
-            json.dump(final_results, f, sort_keys=True, indent=4)
+    lower_qps = -1
+    upper_qps = -1
+    qps_passed = {}
+    while True:
+        print("schedual qps:", qps)
+        sut = lg.ConstructSUT(issue_queries, flush_queries, process_latencies)
+        qsl = lg.ConstructQSL(count, min(count, 500), ds.load_query_samples, ds.unload_query_samples)
+
+        log.info("starting {}".format(scenario))
+        result_dict = {"good": 0, "total": 0, "scenario": str(scenario)}
+        runner.start_run(result_dict, args.accuracy)
+        print("max query count:", settings.max_query_count)
+        lg.StartTest(sut, qsl, settings)
+
+        if not last_timeing:
+            last_timeing = runner.result_timing
+        if args.accuracy:
+            post_proc.finalize(result_dict, ds, output_dir=args.output)
+        took = time.time() - ds.last_loaded
+        add_results(final_results, "{}".format(scenario),
+                    result_dict, last_timeing, took, args.accuracy)
+
+
+        lg.DestroyQSL(qsl)
+        lg.DestroySUT(sut)
+        
+
+        #
+        # write final results
+        #
+        if args.output:
+            with open("results.json", "w") as f:
+                json.dump(final_results, f, sort_keys=True, indent=4)
+
+        if args.scenario != 'Server':
+            break
+
+        if args.auto_qps is False:
+            break
+
+        if lower_qps == -1 or upper_qps == -1:
+            base_qps = len(last_timeing) / took
+            upper_qps = base_qps * 1.5
+            lower_qps = base_qps * 0.5
+            qps = set_qps(lower_qps)
+            continue
+            
+        latency_percentile_ns = np.percentile(last_timeing, settings.server_target_latency_percentile * 100) * NANO_SEC
+        if latency_percentile_ns  < settings.server_target_latency_ns and qps >  upper_qps * 0.98:
+            print("target qps:", qps)
+            break
+
+        if upper_qps - lower_qps < 1 and lower_qps in qps_passed :
+            print("target qps:", lower_qps)
+            break
+
+        if latency_percentile_ns > settings.server_target_latency_ns:
+            #reduce qps
+            print("reduce qps, bound:[%d, %d]" % (lower_qps, upper_qps))
+            upper_qps = qps
+            if qps == lower_qps:
+                lower_qps = lower_qps * 0.5
+                qps = set_qps(lower_qps)
+                continue
+            if qps > lower_qps:
+                qps = set_qps((lower_qps + upper_qps) / 2)
+                continue
+
+        if latency_percentile_ns < settings.server_target_latency_ns:
+            #increase qps
+            qps_passed[qps] = None
+            print("increase qps, bound:[%d, %d]" % (lower_qps, upper_qps))
+            lower_qps = qps
+            if qps == upper_qps:
+                upper_qps = upper_qps * 1.5
+                qps = set_qps(upper_qps)
+                continue
+            if qps < upper_qps:
+                qps = set_qps((lower_qps + upper_qps) / 2)
+                continue
+                
+        runner.finish()
 
 
 if __name__ == "__main__":
